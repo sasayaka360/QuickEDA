@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.DS_Store
+*.csv
+!sample_data/sample.csv
+.vscode/
+.python-version
