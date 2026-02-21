@@ -4,11 +4,21 @@ import io
 import pandas as pd
 import streamlit as st
 
-# AltairはStreamlitでよく使う可視化。入っていない環境の場合は pip install altair
 try:
     import altair as alt
 except Exception:
     alt = None
+
+
+# -----------------------
+# Altair helpers
+# -----------------------
+def a_field(name: str) -> str:
+    """
+    Altairは ':' を shorthand の区切りとして解釈することがあるため、
+    列名に ':' が含まれる場合は '\:' にエスケープする。
+    """
+    return name.replace(":", r"\:")
 
 
 # -----------------------
@@ -19,24 +29,6 @@ def parse_na_values(text: str):
     return [x for x in items if x != ""]
 
 
-def load_csv(
-    uploaded_file,
-    sep=",",
-    encoding="utf-8-sig",
-    skiprows=0,
-    na_values_text="NA,N/A,null,NULL,",
-):
-    uploaded_file.seek(0)
-    df = pd.read_csv(
-        uploaded_file,
-        sep=sep,
-        encoding=encoding,
-        skiprows=skiprows,
-        na_values=parse_na_values(na_values_text),
-    )
-    return df
-
-
 def df_info_text(df: pd.DataFrame) -> str:
     buf = io.StringIO()
     df.info(buf=buf)
@@ -44,7 +36,7 @@ def df_info_text(df: pd.DataFrame) -> str:
 
 
 # -----------------------
-# Metrics / Tables
+# Tables
 # -----------------------
 def missing_table(df: pd.DataFrame) -> pd.DataFrame:
     missing = df.isnull().sum()
@@ -101,25 +93,35 @@ def profile_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------
-# Column type helpers
+# Type helpers
 # -----------------------
 def try_parse_datetime(series: pd.Series, threshold: float = 0.6):
-    """object列などをdatetimeにできそうなら変換して返す。無理ならNone。"""
+    """
+    object/string列をdatetimeにできそうなら変換して返す。無理ならNone。
+    混在タイムゾーン対策として utc=True でパースし、最後にtzを外して datetime64[ns] にする。
+    """
+    # すでにdatetime系ならそのまま（tz付きも含む）
     if pd.api.types.is_datetime64_any_dtype(series):
         return series
-    if series.dtype != "object":
+
+    # pandasのStringDtype（"string"）も対象にする
+    if not (series.dtype == "object" or pd.api.types.is_string_dtype(series)):
         return None
+
     try:
-        parsed = pd.to_datetime(series, errors="coerce", infer_datetime_format=True)
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+        # parsed は datetime64[ns, UTC] になるので .dt が使える
         if parsed.notna().mean() >= threshold:
-            return parsed
+            # 表示・集計を扱いやすくするため tz を外す（datetime64[ns]）
+            return parsed.dt.tz_convert(None)
     except Exception:
         return None
+
     return None
 
 
 # -----------------------
-# Rendering functions (Streamlit UI parts)
+# Rendering (Streamlit)
 # -----------------------
 def render_overview(df: pd.DataFrame):
     st.subheader("データプレビュー")
@@ -152,13 +154,8 @@ def render_profile_and_detail(df: pd.DataFrame):
 
     prof = profile_table(df)
 
-    # 連動用の状態
     if "selected_col" not in st.session_state:
         st.session_state["selected_col"] = df.columns[0]
-
-    st.caption(
-        "表で1行選ぶと、その列が下の「列ごとの詳細」に連動します（対応Streamlitのみ）。"
-    )
 
     selected_from_table = None
     try:
@@ -206,39 +203,36 @@ def render_column_detail(df: pd.DataFrame, target_col: str):
 
     s_dt = try_parse_datetime(s)
 
-    # Altairがない環境でも最低限動くようにフォールバック
     if alt is None:
         st.warning(
             "Altairが未導入のため、可視化は簡易表示になります。必要なら `pip install altair` を実行してください。"
         )
 
-    # 1) 数値列
+    # ---- 数値列
     if pd.api.types.is_numeric_dtype(s):
         st.markdown("### 分布（数値）")
-
         data_num = pd.DataFrame({target_col: s.dropna()})
 
         cc1, cc2 = st.columns(2)
         with cc1:
             if alt is not None and len(data_num) > 0:
                 bins = st.slider(
-                    "ヒストグラム bins",
-                    min_value=5,
-                    max_value=100,
-                    value=30,
-                    key=f"bins_{target_col}",
+                    "ヒストグラム bins", 5, 100, 30, key=f"bins_{target_col}"
                 )
+                f = a_field(target_col)
                 hist = (
                     alt.Chart(data_num)
                     .mark_bar()
                     .encode(
                         x=alt.X(
-                            f"{target_col}:Q",
+                            f,
+                            type="quantitative",
                             bin=alt.Bin(maxbins=bins),
                             title=target_col,
                         ),
-                        y=alt.Y("count():Q", title="count"),
-                        tooltip=["count():Q"],
+                        # count():Q のような「:」付きshorthandを避ける
+                        y=alt.Y("count()", type="quantitative", title="count"),
+                        tooltip=[alt.Tooltip("count()", type="quantitative")],
                     )
                     .properties(height=260)
                 )
@@ -248,10 +242,11 @@ def render_column_detail(df: pd.DataFrame, target_col: str):
 
         with cc2:
             if alt is not None and len(data_num) > 0:
+                f = a_field(target_col)
                 box = (
                     alt.Chart(data_num)
                     .mark_boxplot()
-                    .encode(y=alt.Y(f"{target_col}:Q", title=target_col))
+                    .encode(y=alt.Y(f, type="quantitative", title=target_col))
                     .properties(height=260)
                 )
                 st.altair_chart(box, use_container_width=True)
@@ -269,202 +264,154 @@ def render_column_detail(df: pd.DataFrame, target_col: str):
             df[[target_col]].sort_values(target_col, ascending=False).head(k),
             use_container_width=True,
         )
+        return
 
-    # 2) 日付列
-    elif s_dt is not None:
-        st.markdown("### 時系列（日時）")
-        tmp = pd.DataFrame({"dt": s_dt}).dropna()
-
-        # ★ここが重要：必ずdatetimeに寄せる（ダメならNaTになる）
-        tmp["dt"] = pd.to_datetime(tmp["dt"], errors="coerce")
-        tmp = tmp.dropna()
-
-        # それでもdatetimeにならない場合は日付扱いを諦める（安全策）
-        if not pd.api.types.is_datetime64_any_dtype(tmp["dt"]):
-            st.warning(
-                "日時として解釈できない値が多いため、日時プロットをスキップしました。"
-            )
-            st.dataframe(tmp.head(50), use_container_width=True)
-            return
+    # ---- datetimeっぽい列
+    if s_dt is not None:
+        st.markdown("### 日時の分布")
+        dt_min, dt_max = s_dt.min(), s_dt.max()
+        st.write("期間:", dt_min, "〜", dt_max)
 
         freq = st.selectbox(
-            "集計粒度", ["日次", "週次", "月次"], index=0, key=f"freq_{target_col}"
+            "集計粒度", ["D(日)", "W(週)", "M(月)"], index=2, key=f"dtfreq_{target_col}"
         )
-
-        if freq == "日次":
-            g = tmp.groupby(tmp["dt"].dt.date).size().reset_index(name="count")
-            g.columns = ["date", "count"]
-            x_enc = alt.X("date:T", title="time") if alt is not None else "date"
-        elif freq == "週次":
-            g = (
-                tmp.groupby(tmp["dt"].dt.to_period("W").astype(str))
-                .size()
-                .reset_index(name="count")
-            )
-            g.columns = ["week", "count"]
-            x_enc = alt.X("week:N", title="time") if alt is not None else "week"
+        if freq.startswith("D"):
+            grp = s_dt.dt.to_period("D").astype(str)
+        elif freq.startswith("W"):
+            grp = s_dt.dt.to_period("W").astype(str)
         else:
-            g = (
-                tmp.groupby(tmp["dt"].dt.to_period("M").astype(str))
-                .size()
-                .reset_index(name="count")
-            )
-            g.columns = ["month", "count"]
-            x_enc = alt.X("month:N", title="time") if alt is not None else "month"
+            grp = s_dt.dt.to_period("M").astype(str)
 
-        if alt is not None:
-            chart = (
-                alt.Chart(g)
-                .mark_line(point=True)
+        vc = grp.value_counts().sort_index()
+        st.line_chart(vc)
+
+        st.markdown("### サンプル")
+        st.dataframe(df[[target_col]].dropna().head(50), use_container_width=True)
+        return
+
+    # ---- カテゴリ / 文字列列
+    st.markdown("### 頻度（カテゴリ/文字列）")
+    vc = s.value_counts(dropna=False).head(30)
+    st.dataframe(vc.rename("count").to_frame(), use_container_width=True)
+    if len(vc) > 0:
+        st.bar_chart(vc)
+
+    st.markdown("### サンプル")
+    st.dataframe(df[[target_col]].dropna().head(50), use_container_width=True)
+
+    # カテゴリ×数値（オプション）
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    if len(num_cols) > 0:
+        st.markdown("### カテゴリ × 数値（箱ひげ）")
+        ycol = st.selectbox(
+            "数値列を選択", options=num_cols, index=0, key=f"cat_num_{target_col}"
+        )
+        tmp = df[[target_col, ycol]].dropna().copy()
+
+        topn = st.slider("カテゴリ上位N", 5, 50, 20, key=f"cat_topn_{target_col}")
+        cats = tmp[target_col].value_counts().head(topn).index
+        tmp = tmp[tmp[target_col].isin(cats)]
+
+        if alt is not None and len(tmp) > 0:
+            fx = a_field(target_col)
+            fy = a_field(ycol)
+            box_by_cat = (
+                alt.Chart(tmp)
+                .mark_boxplot()
                 .encode(
-                    x=x_enc,
-                    y=alt.Y("count:Q", title="count"),
-                    tooltip=list(g.columns),
-                )
-                .properties(height=280)
-            )
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.line_chart(g.set_index(g.columns[0])["count"])
-
-        st.dataframe(g.tail(30), use_container_width=True)
-
-    # 3) カテゴリ/文字列列
-    else:
-        st.markdown("### 分布（カテゴリ/文字列）")
-        topn = st.slider("上位Nカテゴリ", 5, 50, 20, key=f"topn_{target_col}")
-
-        vc = s.value_counts(dropna=True).head(topn).reset_index()
-        vc.columns = ["category", "count"]
-
-        if alt is not None:
-            bar = (
-                alt.Chart(vc)
-                .mark_bar()
-                .encode(
-                    y=alt.Y("category:N", sort="-x", title=target_col),
-                    x=alt.X("count:Q", title="count"),
-                    tooltip=["category:N", "count:Q"],
+                    x=alt.X(fx, type="nominal", sort="-y", title=target_col),
+                    y=alt.Y(fy, type="quantitative", title=ycol),
+                    tooltip=[
+                        alt.Tooltip(fx, type="nominal", title=target_col),
+                        alt.Tooltip(fy, type="quantitative", title=ycol),
+                    ],
                 )
                 .properties(height=320)
             )
-            st.altair_chart(bar, use_container_width=True)
+            st.altair_chart(box_by_cat, use_container_width=True)
         else:
-            st.dataframe(vc, use_container_width=True)
-
-        st.markdown("### カテゴリ別の箱ひげ図（数値列がある場合）")
-        num_cols = df.select_dtypes(include="number").columns.tolist()
-        if len(num_cols) == 0:
-            st.info("数値列がないため、カテゴリ別箱ひげ図は表示できません。")
-        else:
-            ycol = st.selectbox(
-                "Y（数値）を選択", options=num_cols, key=f"ycol_{target_col}"
-            )
-            tmp = df[[target_col, ycol]].dropna()
-
-            limit_cats = st.checkbox(
-                "カテゴリ数を上位に絞る（見やすさ優先）",
-                value=True,
-                key=f"limitcats_{target_col}",
-            )
-            if limit_cats:
-                topcats = df[target_col].value_counts(dropna=True).head(20).index
-                tmp = tmp[tmp[target_col].isin(topcats)]
-
-            if alt is not None and len(tmp) > 0:
-                box_by_cat = (
-                    alt.Chart(tmp)
-                    .mark_boxplot()
-                    .encode(
-                        x=alt.X(f"{target_col}:N", sort="-y", title=target_col),
-                        y=alt.Y(f"{ycol}:Q", title=ycol),
-                        tooltip=[
-                            alt.Tooltip(f"{target_col}:N"),
-                            alt.Tooltip(f"{ycol}:Q"),
-                        ],
-                    )
-                    .properties(height=320)
-                )
-                st.altair_chart(box_by_cat, use_container_width=True)
-            else:
-                st.dataframe(tmp.head(200), use_container_width=True)
-
-        st.markdown("### 上位カテゴリ一覧")
-        st.dataframe(vc, use_container_width=True)
-
-    st.markdown("### 生値サンプル")
-    sample_mode = st.radio(
-        "表示内容",
-        ["先頭20", "欠損行（この列が欠損）", "非欠損行（この列が埋まっている）"],
-        horizontal=True,
-        key=f"samplemode_{target_col}",
-    )
-    if sample_mode == "先頭20":
-        st.dataframe(df[[target_col]].head(20), use_container_width=True)
-    elif sample_mode == "欠損行（この列が欠損）":
-        st.dataframe(df[df[target_col].isnull()].head(50), use_container_width=True)
-    else:
-        st.dataframe(df[df[target_col].notnull()].head(50), use_container_width=True)
+            st.write(tmp.groupby(target_col)[ycol].describe())
 
 
 def render_filter(df: pd.DataFrame):
-    st.subheader("フィルタ/抽出")
+    st.subheader("フィルタ＆ダウンロード（実データ確認）")
+    st.caption("列を選び、条件を指定して抽出します（簡易版）。")
 
-    show_cols = st.multiselect(
-        "表示する列", options=list(df.columns), default=list(df.columns)
-    )
-    view_df = df[show_cols].copy() if show_cols else df.copy()
+    cols = list(df.columns)
+    if len(cols) == 0:
+        st.info("列がありません。")
+        return
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        only_missing = st.checkbox("欠損がある行だけ")
-    with c2:
-        only_duplicates = st.checkbox("重複行だけ")
-    with c3:
-        limit_rows = st.number_input(
-            "表示行数上限", min_value=10, max_value=20000, value=500, step=10
+    target_col = st.selectbox("フィルタ対象列", cols, key="filter_col")
+    s = df[target_col]
+    filtered = df.copy()
+
+    if pd.api.types.is_numeric_dtype(s):
+        vmin = float(pd.to_numeric(s, errors="coerce").min())
+        vmax = float(pd.to_numeric(s, errors="coerce").max())
+        if pd.isna(vmin) or pd.isna(vmax):
+            st.info("数値として扱える値がありません。")
+        else:
+            lo, hi = st.slider(
+                "範囲",
+                min_value=vmin,
+                max_value=vmax,
+                value=(vmin, vmax),
+                key=f"num_range_{target_col}",
+            )
+            filtered = filtered[
+                pd.to_numeric(filtered[target_col], errors="coerce").between(lo, hi)
+            ]
+    else:
+        mode = st.radio(
+            "条件",
+            ["含む（部分一致）", "一致（完全一致）", "上位カテゴリから選択"],
+            horizontal=True,
+            key=f"str_mode_{target_col}",
         )
+        if mode == "上位カテゴリから選択":
+            top = s.value_counts(dropna=False).head(50).index.tolist()
+            selected = st.multiselect("選択", options=top, default=top[:3])
+            if selected:
+                filtered = filtered[filtered[target_col].isin(selected)]
+        else:
+            q = st.text_input("検索文字列")
+            if q:
+                if mode == "一致（完全一致）":
+                    filtered = filtered[filtered[target_col].astype(str) == q]
+                else:
+                    filtered = filtered[
+                        filtered[target_col].astype(str).str.contains(q, na=False)
+                    ]
 
-    if only_missing:
-        view_df = view_df[view_df.isnull().any(axis=1)]
-    if only_duplicates:
-        view_df = view_df[view_df.duplicated(keep=False)]
+    st.write(f"抽出結果: {filtered.shape[0]:,} 行 × {filtered.shape[1]:,} 列")
+    st.dataframe(filtered.head(200), use_container_width=True)
 
-    st.dataframe(view_df.head(int(limit_rows)), use_container_width=True)
-    st.caption(f"抽出後: {len(view_df):,} 行")
-
-    st.subheader("CSVとしてダウンロード（抽出結果）")
-    csv_bytes = view_df.to_csv(index=False).encode("utf-8-sig")
+    csv = filtered.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "抽出結果をCSVでダウンロード",
-        data=csv_bytes,
+        "抽出結果をCSVダウンロード",
+        data=csv,
         file_name="filtered.csv",
         mime="text/csv",
     )
 
 
 def render_viz(df: pd.DataFrame):
-    st.subheader("可視化")
+    st.subheader("可視化（簡易）")
 
-    st.markdown("### ヒストグラム（数値列）")
-    num_cols = df.select_dtypes(include="number").columns.tolist()
-    if len(num_cols) == 0:
-        st.info("数値列がないため、ヒストグラムは表示できません。")
+    st.markdown("### 欠損率（上位20列）")
+    miss = (df.isnull().mean().sort_values(ascending=False) * 100).head(20)
+    if miss.max() == 0:
+        st.success("欠損は見当たりません。")
     else:
-        x = st.selectbox("数値列を選択", options=num_cols, key="viz_num_col")
-        bins = st.slider("bins", min_value=5, max_value=100, value=30, key="viz_bins")
-        st.bar_chart(df[x].dropna().value_counts(bins=bins).sort_index())
+        st.dataframe(miss.rename("missing_%").to_frame(), use_container_width=True)
+        st.bar_chart(miss)
 
     st.markdown("### 相関（数値列）")
+    num_cols = df.select_dtypes(include="number").columns.tolist()
     if len(num_cols) < 2:
         st.info("数値列が2列以上ないため、相関は表示できません。")
-    else:
-        corr = df[num_cols].corr(numeric_only=True)
-        st.dataframe(corr, use_container_width=True)
+        return
 
-    st.markdown("### 欠損率の可視化（上位20列）")
-    miss = df.isnull().mean().sort_values(ascending=False).head(20) * 100
-    if miss.max() == 0:
-        st.success("欠損は見当たりません（少なくとも上位20列では0%）。")
-    else:
-        st.bar_chart(miss)
+    corr = df[num_cols].corr(numeric_only=True)
+    st.dataframe(corr, use_container_width=True)
